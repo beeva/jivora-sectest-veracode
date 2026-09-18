@@ -1,0 +1,115 @@
+name: veracode
+
+# Veracode splits into two products, and this repository exercises both:
+#   - Static Analysis (SAST) over a packaged application archive
+#   - Software Composition Analysis (SCA / SourceClear) over the manifests
+#
+# Pipeline Scan is the fast PR-time variant; Policy Scan is the slower one that
+# produces the compliance artefact. Run both -- the gap between them is most of
+# what you are paying Veracode for.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  package:
+    name: Package for upload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Veracode wants dependencies present so it can resolve module boundaries.
+      - name: Install workspaces
+        continue-on-error: true
+        run: |
+          for app in Jivora-backend jivora-web jivora-admin; do
+            (cd "$app" && npm install --no-audit --no-fund) || true
+          done
+
+      - name: Build archive
+        run: |
+          zip -r jivora-sectest.zip . \
+            -x '*.git*' \
+            -x '*/node_modules/.cache/*'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jivora-sectest-archive
+          path: jivora-sectest.zip
+
+  pipeline-scan:
+    name: Pipeline Scan (fast SAST)
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jivora-sectest-archive
+
+      - name: Run Pipeline Scan
+        continue-on-error: true
+        env:
+          VERACODE_API_ID: ${{ secrets.VERACODE_API_ID }}
+          VERACODE_API_KEY: ${{ secrets.VERACODE_API_KEY }}
+        run: |
+          curl -fsSO https://downloads.veracode.com/securityscan/pipeline-scan-LATEST.zip
+          unzip -q pipeline-scan-LATEST.zip
+          java -jar pipeline-scan.jar \
+            --veracode_api_id "$VERACODE_API_ID" \
+            --veracode_api_key "$VERACODE_API_KEY" \
+            --file jivora-sectest.zip \
+            --fail_on_severity="Very High, High, Medium, Low" \
+            --json_output_file=veracode-pipeline.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: veracode-pipeline-results
+          path: veracode-pipeline.json
+          if-no-files-found: warn
+
+  policy-scan:
+    name: Policy Scan (full SAST)
+    needs: package
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jivora-sectest-archive
+
+      # Confirm the current action ref against the Veracode marketplace listing
+      # before relying on this; pin to a SHA once chosen.
+      - uses: veracode/veracode-uploadandscan-action@master
+        continue-on-error: true
+        with:
+          appname: jivora-sectest
+          createprofile: true
+          filepath: jivora-sectest.zip
+          vid: ${{ secrets.VERACODE_API_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY }}
+          scantimeout: 45
+
+  sca:
+    name: Software Composition Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Agent-based SCA
+        continue-on-error: true
+        env:
+          SRCCLR_API_TOKEN: ${{ secrets.SRCCLR_API_TOKEN }}
+        run: |
+          curl -fsSL https://download.sourceclear.com/ci.sh | sh -s -- scan --recursive
